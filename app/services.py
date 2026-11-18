@@ -1,10 +1,11 @@
 """Transactional services: revision acceptance and package generation."""
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import config, deid
+from . import config, deid, diffqc
 from .csvutil import Row, canonical_hash, parse_csv
 from .database import get_conn, write_lock
 
@@ -35,10 +36,18 @@ def accept_revision(cohort_id: str, revision_label: str, rows: list[Row], raw: b
     * same (cohort, revision) + different hash -> :class:`ConflictError`
       (HTTP 409), nothing is changed;
     * a new revision supersedes every non-terminal package of the cohort and
-      creates a fresh ``pending`` package, so accepting a revision immediately
-      withdraws the current eligibility of the old package;
+      creates a fresh package, so accepting a revision immediately withdraws
+      the current eligibility of the old package;
     * new subjects receive stable pseudonyms and per-subject date shifts,
-      existing subjects keep theirs across revisions.
+      existing subjects keep theirs across revisions;
+    * every revision after the first one is diffed against the cohort's
+      currently in-force revision (identical visits cancel first; uniquely
+      attributable additions/removals/corrections are listed; anything that
+      cannot be paired uniquely is flagged ambiguous with both sides' CSV
+      line numbers). An ambiguous revision is still accepted and the old
+      package is still withdrawn immediately, but the new package is created
+      in the ``held`` state: it never enters the build queue and cannot be
+      downloaded until a corrected revision passes QC.
     """
     content_hash = canonical_hash(rows)
     now = _utcnow()
@@ -65,7 +74,7 @@ def accept_revision(cohort_id: str, revision_label: str, rows: list[Row], raw: b
                 )
 
             cohort = conn.execute(
-                "SELECT cohort_id, salt FROM cohorts WHERE cohort_id = ?",
+                "SELECT cohort_id, salt, current_revision FROM cohorts WHERE cohort_id = ?",
                 (cohort_id,),
             ).fetchone()
             if cohort is None:
@@ -74,8 +83,10 @@ def accept_revision(cohort_id: str, revision_label: str, rows: list[Row], raw: b
                     "INSERT INTO cohorts (cohort_id, salt, created_at) VALUES (?, ?, ?)",
                     (cohort_id, salt, now),
                 )
+                base_revision = None
             else:
                 salt = cohort["salt"]
+                base_revision = cohort["current_revision"]
 
             # Assign stable identities to any subjects not seen before.
             max_idx_row = conn.execute(
@@ -102,6 +113,50 @@ def accept_revision(cohort_id: str, revision_label: str, rows: list[Row], raw: b
                     )
                     next_index += 1
 
+            # Revision-difference QC against the currently in-force revision.
+            # The first revision of a cohort follows the original flow (no
+            # baseline to compare with).
+            diff_view = None
+            qc_ambiguous = False
+            if base_revision is not None:
+                base = conn.execute(
+                    "SELECT raw_path FROM revisions "
+                    "WHERE cohort_id = ? AND revision = ?",
+                    (cohort_id, base_revision),
+                ).fetchone()
+                base_rows = parse_csv(Path(base["raw_path"]).read_bytes())
+                identity_rows = conn.execute(
+                    "SELECT subject_id, pseudonym, date_shift_days FROM subjects "
+                    "WHERE cohort_id = ?",
+                    (cohort_id,),
+                ).fetchall()
+                identity = {
+                    r["subject_id"]: (r["pseudonym"], r["date_shift_days"])
+                    for r in identity_rows
+                }
+                diff_result = diffqc.compute_diff(base_rows, rows)
+                diff_view = diffqc.render_diff(
+                    diff_result,
+                    identity,
+                    cohort_id,
+                    int(revision_label),
+                    int(base_revision),
+                )
+                qc_ambiguous = diff_result.ambiguous
+                conn.execute(
+                    "INSERT INTO revision_diffs "
+                    "(cohort_id, revision, base_revision, qc_ambiguous, diff_json, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        cohort_id,
+                        revision_label,
+                        base_revision,
+                        1 if qc_ambiguous else 0,
+                        json.dumps(diff_view, ensure_ascii=False, sort_keys=True),
+                        now,
+                    ),
+                )
+
             raw_dir = _cohort_dir(cohort_id)
             raw_dir.mkdir(parents=True, exist_ok=True)
             raw_path = raw_dir / f"rev{revision_label}.csv"
@@ -120,13 +175,17 @@ def accept_revision(cohort_id: str, revision_label: str, rows: list[Row], raw: b
             # retires the previously downloadable package.
             conn.execute(
                 "UPDATE packages SET status = 'superseded', updated_at = ? "
-                "WHERE cohort_id = ? AND status IN ('pending', 'generating', 'failed', 'published')",
+                "WHERE cohort_id = ? AND status IN ('pending', 'generating', 'failed', 'published', 'held')",
                 (now, cohort_id),
             )
+            # An ambiguous revision is accepted but its package is held back
+            # from the build queue (and therefore from downloads) until a
+            # later corrected revision passes QC.
+            new_status = "held" if qc_ambiguous else "pending"
             conn.execute(
                 "INSERT INTO packages (cohort_id, revision, status, created_at, updated_at) "
-                "VALUES (?, ?, 'pending', ?, ?)",
-                (cohort_id, revision_label, now, now),
+                "VALUES (?, ?, ?, ?, ?)",
+                (cohort_id, revision_label, new_status, now, now),
             )
             conn.execute(
                 "UPDATE cohorts SET current_revision = ? WHERE cohort_id = ?",
@@ -138,6 +197,13 @@ def accept_revision(cohort_id: str, revision_label: str, rows: list[Row], raw: b
                 "revision": revision_label,
                 "content_hash": content_hash,
                 "rows": len(rows),
+                "qc": {
+                    "checked": base_revision is not None,
+                    "ambiguous": qc_ambiguous,
+                    "base_revision": int(base_revision) if base_revision is not None else None,
+                    "package_status": new_status,
+                    "summary": diff_view["summary"] if diff_view is not None else None,
+                },
             }
         except Exception:
             conn.execute("ROLLBACK")
@@ -146,6 +212,21 @@ def accept_revision(cohort_id: str, revision_label: str, rows: list[Row], raw: b
             raise
         finally:
             conn.close()
+
+
+def get_revision_diff(cohort_id: str, revision_label) -> dict | None:
+    """Load the stored, already de-identified diff for a revision."""
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT diff_json FROM revision_diffs WHERE cohort_id = ? AND revision = ?",
+            (cohort_id, revision_label),
+        ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["diff_json"])
+    finally:
+        conn.close()
 
 
 def claim_pending_package() -> tuple[str, str] | None:

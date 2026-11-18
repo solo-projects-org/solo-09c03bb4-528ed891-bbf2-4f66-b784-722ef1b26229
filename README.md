@@ -15,7 +15,9 @@ docker compose up --build
 
 1. 填写队列 ID 与修订号，选择完整 CSV 并“受理修订”；
 2. 列表每 2.5 秒自动刷新，包状态依次为 `待生成 → 生成中 → 已发布`；
-3. 已发布后点击“下载当前包”。API 交互文档见 <http://localhost:8000/docs>。
+   若修订差异质检存在歧义，状态显示 `待核·歧义未解决`，新包不可下载；
+3. 已发布后点击“下载当前包”。点击“查看差异”可在网页弹窗中查看只含
+   稳定假名 / 平移日期的修订差异。API 交互文档见 <http://localhost:8000/docs>。
 
 数据保存在命名卷 `deid-data`（容器内 `/data`，含 SQLite 库、原始上传与生成的包），
 容器重启不丢失。
@@ -41,6 +43,34 @@ P001,2026-02-10,13.0
 日期必须为 `YYYY-MM-DD`，测值必须是有限数字。空文件、缺列、坏日期/数字、无数据行
 一律返回 400 拒绝，不会产生修订。
 
+## 修订差异质检
+
+同一受试者同日可能存在多条测值，因此第二次及以后的修订受理时，系统会对照该队列
+**当前现行修订**做差异质检（首次修订无基线，沿用原生成流程）。配对规则保守，绝不按
+行序猜测更正：
+
+1. **先抵消完全相同的访视**：受试者、访视日期、测值三者一致的记录按多重性逐条抵消；
+2. 剩余记录按（受试者、访视日期）分组：
+   - 只在新修订出现 → `added`（新增，附新 CSV 行号）；
+   - 只在旧修订出现 → `removed`（删除，附旧 CSV 行号）；
+   - 两侧各一条且测值不同 → `corrected`（测值更正，附双方行号与新旧测值）；
+   - 任一侧同日多条、无法唯一配对 → `ambiguous`（歧义），列出双方候选记录的
+     **CSV 物理行号与测值**，交数据员人工辨清。
+
+差异结果只保存/返回**稳定假名与平移后日期**；原始受试者号、原始访视日期不进入差异
+存储，也不出现在任何接口或网页中。
+
+**含歧义修订的处置（受理但不出包）**：
+
+- 修订照常受理（HTTP 202），同一事务内旧包（含已发布包）立即标 `superseded` 失去
+  下载资格；
+- 新包进入终态式的 `held`（待核）状态：不进入后台构建队列、没有包文件、下载与手动
+  重试均返回 409；
+- 数据员上传**更正后的新修订且质检通过**（无歧义）后，该修订的包恢复 `pending` 并
+  正常构建发布，下载随之恢复；
+- 进程重启不会放行待核修订：启动恢复只复位 `generating`/`failed`，`held` 原样保留；
+  后台构建故障同样走 `failed` 重试，绝不下发未核内容。
+
 ## 去标识规则
 
 | 项目 | 规则 |
@@ -64,22 +94,26 @@ P001,2026-02-10,13.0
 - **重启恢复**：进程崩溃时停留在 `generating` 的包，启动时统一复位为 `pending`，
   绝不下发半成品（包文件采用临时文件 + 原子 rename）。
 - **迟到生成不覆盖**：构建完成的落库 UPDATE 带条件——仅当包仍是 `generating` 且该修订
-  仍是队列当前修订时才发布；否则丢弃产物，新修订不受影响。
-- **队列互不阻塞**：单后台线程串行构建，一个队列待生成/失败不影响其他队列已发布包下载。
+  仍是队列当前修订时才发布；否则丢弃产物，新修订不受影响。即使迟到结果属于一个质检
+  通过的旧修订、而当前修订正处于 `held`，迟到结果同样被丢弃，绝不越过待核闸门发布。
+- **队列互不阻塞**：单后台线程串行构建，一个队列待生成/待核/失败不影响其他队列已发布
+  包下载（`held` 包不会被构建线程认领）。
 
 包状态机：`pending → generating → published`，失败到 `failed`（可回 `pending`），
+质检歧义到 `held`（该包行不再回到构建队列，只能被更新的修订取代为 `superseded`），
 被新修订取代到 `superseded`（终态）。只有当前修订且 `published` 的包可下载
-（pending/generating/failed 返回 409，文件缺失自动重新排队）。
+（pending/generating/failed/held 返回 409，文件缺失自动重新排队）。
 
 ## HTTP API 摘要
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/api/cohorts/{cohort_id}/revisions/{revision}` | 上传完整修订 CSV（multipart 字段 `file`） |
-| GET | `/api/cohorts` | 队列总览与当前包状态 |
-| GET | `/api/cohorts/{cohort_id}` | 队列详情（全部修订与包状态） |
+| POST | `/api/cohorts/{cohort_id}/revisions/{revision}` | 上传完整修订 CSV（multipart 字段 `file`）；响应含 `qc` 质检摘要 |
+| GET | `/api/cohorts` | 队列总览与当前包状态（含质检标记） |
+| GET | `/api/cohorts/{cohort_id}` | 队列详情（全部修订、包状态、差异索引与当前差异） |
+| GET | `/api/cohorts/{cohort_id}/revisions/{revision}/diff` | 该修订相对基线修订的去标识差异（仅假名/平移日期/行号）；首次修订 404 |
 | GET | `/api/cohorts/{cohort_id}/package` | 下载当前已发布去标识包（zip） |
-| POST | `/api/cohorts/{cohort_id}/retry` | 失败包立即重新排队 |
+| POST | `/api/cohorts/{cohort_id}/retry` | 失败包立即重新排队（`held` 返回 409） |
 | GET | `/health` | 健康检查 |
 
 ## 测试
@@ -89,14 +123,16 @@ pip install -r requirements-dev.txt
 python -m pytest tests/ -q
 ```
 
-22 个用例覆盖端到端去标识、跨修订假名/偏移稳定、队列独立、冲突拒绝、幂等上传、
-失败重试、重启恢复、迟到构建丢弃、其他队列不受影响与非法输入拒绝。
+38 个用例覆盖端到端去标识、跨修订假名/偏移稳定、队列独立、冲突拒绝、幂等上传、
+失败重试、重启恢复、迟到构建丢弃、其他队列不受影响、非法输入拒绝，以及差异质检的
+相同抵消/唯一配对/歧义双方行号、待核包不可下载且重启不放行、更正修订恢复出包与
+差异载荷的去标识核查。
 
 ## 目录结构
 
 ```
-app/            FastAPI 应用（config/database/csvutil/deid/services/worker/main）
-static/         浏览器单页入口
+app/            FastAPI 应用（config/database/csvutil/diffqc/deid/services/worker/main）
+static/         浏览器单页入口（含差异质检弹窗）
 tests/          pytest 测试
 data/           运行期数据（.gitignore 排除，不入库）
 Dockerfile / docker-compose.yml

@@ -32,6 +32,8 @@ class Row:
     subject_id: str
     visit_date: date
     value: float
+    #: Physical 1-based line number in the source CSV (header is line 1).
+    line_no: int
 
 
 def _normalise_header(name: str) -> str:
@@ -105,7 +107,14 @@ def parse_csv(content: bytes) -> list[Row]:
         if not math.isfinite(value):
             raise CSVValidationError(f"第 {line_no} 行测值必须是有限数字: {value_text!r}")
 
-        rows.append(Row(subject_id=subject_id, visit_date=visit_date, value=value))
+        rows.append(
+            Row(
+                subject_id=subject_id,
+                visit_date=visit_date,
+                value=value,
+                line_no=line_no,
+            )
+        )
 
     if not rows:
         raise CSVValidationError("CSV 不包含任何数据行，不能作为完整修订受理")

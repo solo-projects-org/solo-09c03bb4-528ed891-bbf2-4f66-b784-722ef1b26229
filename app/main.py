@@ -1,6 +1,7 @@
 """FastAPI application: revision intake, status polling and package download."""
 from __future__ import annotations
 
+import json
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -12,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from . import config
 from .csvutil import CSVValidationError, parse_csv
 from .database import get_conn, init_db, reset_interrupted_packages
-from .services import ConflictError, accept_revision
+from .services import ConflictError, accept_revision, get_revision_diff
 from .worker import PackageWorker
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -136,6 +137,11 @@ def cohort_status(cohort_id: str) -> dict:
             "FROM packages WHERE cohort_id = ? ORDER BY revision",
             (cohort_id,),
         ).fetchall()
+        diff_rows = conn.execute(
+            "SELECT revision, base_revision, qc_ambiguous FROM revision_diffs "
+            "WHERE cohort_id = ? ORDER BY revision",
+            (cohort_id,),
+        ).fetchall()
         return {
             "cohort_id": cohort_id,
             "current_revision": str(cohort["current_revision"])
@@ -145,10 +151,57 @@ def cohort_status(cohort_id: str) -> dict:
                 {**dict(r), "revision": str(r["revision"])} for r in revisions
             ],
             "packages": [_package_status_dict(r) for r in packages],
+            "diffs": [
+                {
+                    "revision": str(r["revision"]),
+                    "base_revision": str(r["base_revision"]),
+                    "qc_ambiguous": bool(r["qc_ambiguous"]),
+                }
+                for r in diff_rows
+            ],
+            "current_diff": _current_diff_view(conn, cohort_id, cohort["current_revision"]),
             "current_package": _package_view(conn, cohort_id, cohort["current_revision"]),
         }
     finally:
         conn.close()
+
+
+@app.get("/api/cohorts/{cohort_id}/revisions/{revision_label}/diff")
+def revision_diff(cohort_id: str, revision_label: str) -> dict:
+    """De-identified QC diff of a revision against its baseline revision.
+
+    The payload contains stable pseudonyms and shifted dates only; original
+    subject ids and original visit dates are never included. The first
+    revision of a cohort has no diff (404).
+    """
+    if not config.is_valid_identifier(cohort_id):
+        raise HTTPException(status_code=400, detail="队列 ID 只能包含字母、数字、_ - . 且长度 ≤128")
+    if not config.is_valid_identifier(revision_label):
+        raise HTTPException(status_code=400, detail="修订号只能包含字母、数字、_ - . 且长度 ≤128")
+    conn = get_conn()
+    try:
+        cohort = conn.execute(
+            "SELECT 1 FROM cohorts WHERE cohort_id = ?", (cohort_id,)
+        ).fetchone()
+        if cohort is None:
+            raise HTTPException(status_code=404, detail="队列不存在")
+        revision = conn.execute(
+            "SELECT revision FROM revisions WHERE cohort_id = ? AND revision = ?",
+            (cohort_id, revision_label),
+        ).fetchone()
+        if revision is None:
+            raise HTTPException(status_code=404, detail="该修订不存在")
+    finally:
+        conn.close()
+
+    diff = get_revision_diff(cohort_id, revision["revision"])
+    if diff is None:
+        raise HTTPException(status_code=404, detail="该修订为队列首次修订，无差异基线")
+    # Localise integer revision labels to strings for a stable wire format.
+    diff = dict(diff)
+    diff["revision"] = str(diff["revision"])
+    diff["base_revision"] = str(diff["base_revision"])
+    return diff
 
 
 @app.post("/api/cohorts/{cohort_id}/retry")
@@ -170,6 +223,11 @@ def retry_current(cohort_id: str) -> dict:
             raise HTTPException(status_code=404, detail="当前修订没有待生成的包")
         if pkg["status"] == "published":
             return {"status": "published", "revision": str(revision_label)}
+        if pkg["status"] == "held":
+            raise HTTPException(
+                status_code=409,
+                detail="当前修订存在未解决的歧义，包保持待核；请上传更正修订并通过质检后再生成",
+            )
         if pkg["status"] != "failed":
             raise HTTPException(
                 status_code=409,
@@ -218,6 +276,7 @@ def download_current_package(cohort_id: str):
                     "generating": "包正在生成中，请稍后重试",
                     "failed": f"上次生成失败，等待自动重试: {pkg['last_error']}",
                     "superseded": "该包已被更新的修订取代",
+                    "held": "当前修订存在未解决的歧义，包保持待核、不可下载；请上传更正修订并通过质检",
                 }.get(pkg["status"], f"当前状态 {pkg['status']} 不可下载"),
             )
 
@@ -245,14 +304,33 @@ def _package_view(conn, cohort_id: str, revision_label) -> dict | None:
     if revision_label is None:
         return None
     row = conn.execute(
-        "SELECT revision, status, attempts, last_error, next_retry_at, updated_at "
-        "FROM packages WHERE cohort_id = ? AND revision = ?",
+        "SELECT p.revision, p.status, p.attempts, p.last_error, p.next_retry_at, p.updated_at, "
+        "d.qc_ambiguous, d.base_revision AS diff_base_revision "
+        "FROM packages p LEFT JOIN revision_diffs d "
+        "ON d.cohort_id = p.cohort_id AND d.revision = p.revision "
+        "WHERE p.cohort_id = ? AND p.revision = ?",
         (cohort_id, revision_label),
     ).fetchone()
     return _package_status_dict(row) if row else None
 
 
+def _current_diff_view(conn, cohort_id: str, revision_label) -> dict | None:
+    if revision_label is None:
+        return None
+    row = conn.execute(
+        "SELECT diff_json FROM revision_diffs WHERE cohort_id = ? AND revision = ?",
+        (cohort_id, revision_label),
+    ).fetchone()
+    if row is None:
+        return None
+    diff = json.loads(row["diff_json"])
+    diff["revision"] = str(diff["revision"])
+    diff["base_revision"] = str(diff["base_revision"])
+    return diff
+
+
 def _package_status_dict(row) -> dict:
+    keys = row.keys()
     return {
         "revision": str(row["revision"]),
         "status": row["status"],
@@ -261,6 +339,10 @@ def _package_status_dict(row) -> dict:
         "next_retry_at": row["next_retry_at"],
         "updated_at": row["updated_at"],
         "download_available": row["status"] == "published",
+        "qc_ambiguous": bool(row["qc_ambiguous"]) if "qc_ambiguous" in keys else False,
+        "diff_base_revision": str(row["diff_base_revision"])
+        if "diff_base_revision" in keys and row["diff_base_revision"] is not None
+        else None,
     }
 
 

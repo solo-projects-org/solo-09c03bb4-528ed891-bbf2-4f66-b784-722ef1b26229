@@ -24,6 +24,7 @@
            font-size:14px; cursor:pointer; }
   button:hover { filter:brightness(1.08); }
   button.ghost { background:#fff; color:var(--blue); border:1px solid var(--blue); }
+  button.mini { padding:4px 10px; font-size:12px; }
   table { width:100%; border-collapse:collapse; font-size:13px; }
   th, td { text-align:left; padding:9px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
   th { color:var(--muted); font-weight:600; background:#f8fafc; }
@@ -33,21 +34,45 @@
   .b-published { background:#d1fae5; color:#065f46; }
   .b-failed    { background:#fee2e2; color:#991b1b; }
   .b-superseded{ background:#e2e8f0; color:#475569; }
+  .b-held      { background:#ffedd5; color:#9a3412; }
   .msg { margin-top:12px; padding:10px 12px; border-radius:8px; font-size:13px; display:none; }
   .msg.ok  { display:block; background:#ecfdf5; color:#065f46; border:1px solid #a7f3d0; }
   .msg.err { display:block; background:#fef2f2; color:#991b1b; border:1px solid #fecaca; }
+  .msg.warn { display:block; background:#fffbeb; color:#92400e; border:1px solid #fde68a; }
   .hint { font-size:12px; color:var(--muted); margin-top:8px; line-height:1.6; }
   .muted { color:var(--muted); }
   code { background:#f1f5f9; padding:1px 6px; border-radius:5px; font-size:12px; }
   .err-detail { color:var(--red); font-size:12px; margin-top:4px; word-break:break-all; }
   a.dl { color:var(--blue); text-decoration:none; font-weight:600; }
   .empty { text-align:center; color:var(--muted); padding:24px 0; font-size:13px; }
+  .qc-chip { display:inline-block; margin-top:6px; font-size:12px; padding:2px 8px; border-radius:6px; }
+  .qc-ok { background:#ecfdf5; color:#065f46; border:1px solid #a7f3d0; }
+  .qc-bad { background:#fff7ed; color:#9a3412; border:1px solid #fdba74; }
+  .modal-backdrop { position:fixed; inset:0; background:rgba(15,23,42,.55); display:none;
+                    align-items:flex-start; justify-content:center; z-index:50; padding:40px 16px; overflow:auto; }
+  .modal-backdrop.open { display:flex; }
+  .modal { background:#fff; border-radius:12px; max-width:900px; width:100%; padding:22px; }
+  .modal h3 { margin:0 0 6px; font-size:16px; }
+  .modal .sub { color:var(--muted); font-size:12px; margin-bottom:14px; }
+  .summary-grid { display:grid; grid-template-columns:repeat(5,1fr); gap:8px; margin-bottom:14px; }
+  .summary-grid .cell { background:#f8fafc; border:1px solid var(--line); border-radius:8px;
+                        padding:8px; text-align:center; }
+  .summary-grid .num { font-size:18px; font-weight:700; }
+  .summary-grid .lbl { font-size:11px; color:var(--muted); margin-top:2px; }
+  .kind-tag { display:inline-block; padding:1px 8px; border-radius:999px; font-size:11px; }
+  .k-added { background:#d1fae5; color:#065f46; }
+  .k-removed { background:#fee2e2; color:#991b1b; }
+  .k-corrected { background:#e0e7ff; color:#3730a3; }
+  .k-ambiguous { background:#ffedd5; color:#9a3412; }
+  .amb-box { border:1px solid #fdba74; background:#fff7ed; border-radius:8px; padding:8px 10px;
+             font-size:12px; margin-top:4px; }
+  .modal-close { float:right; }
 </style>
 </head>
 <body>
 <header>
   <h1>随访数据去标识包服务</h1>
-  <p>按队列上传递增修订 · 下载只含稳定假名 / 平移日期 / 测值的去标识包 · 原始身份与日期不出包</p>
+  <p>按队列上传完整修订 · 下载只含稳定假名 / 平移日期 / 测值的去标识包 · 原始身份与日期不出包</p>
 </header>
 
 <main>
@@ -74,8 +99,10 @@
       </div>
       <div id="uploadMsg" class="msg"></div>
       <p class="hint">
-        受理成功即撤下该队列旧包的现行资格，新包进入待生成队列；后台生成完成前不可下载，
-        生成失败会自动重试且重启后仍显示待生成。
+        受理成功即撤下该队列旧包的现行资格。首次修订沿用原生成流程；后续修订先做差异质检：
+        完全相同的访视自动抵消，可唯一判断的新增 / 删除 / 测值更正照常列出，无法唯一配对的记录
+        标为歧义并给出双方 CSV 行号（不按行序猜测）。含歧义的修订仍会受理、旧包立即撤下，
+        但新包保持待核、不可下载；上传更正修订且质检通过后才恢复出包。
       </p>
     </form>
   </section>
@@ -86,11 +113,22 @@
   </section>
 </main>
 
+<div class="modal-backdrop" id="diffModal">
+  <div class="modal">
+    <button type="button" class="ghost mini modal-close" id="diffClose">关闭</button>
+    <h3 id="diffTitle">修订差异质检</h3>
+    <div class="sub" id="diffSub"></div>
+    <div id="diffBody"></div>
+  </div>
+</div>
+
 <script>
 const STATUS_TEXT = {
   pending: "待生成", generating: "生成中", published: "已发布",
-  failed: "生成失败·自动重试中", superseded: "已被新修订取代"
+  failed: "生成失败·自动重试中", superseded: "已被新修订取代",
+  held: "待核·歧义未解决（不可下载）"
 };
+const KIND_TEXT = { added: "新增", removed: "删除", corrected: "测值更正", ambiguous: "歧义" };
 
 function showMsg(el, kind, text) {
   el.className = "msg " + kind;
@@ -108,8 +146,20 @@ async function refresh() {
     }
     listEl.innerHTML = renderTable(data.cohorts);
   } catch (e) {
-    listEl.innerHTML = '<div class="empty" style="color:#dc2626">状态加载失败: ' + e + "</div>";
+    listEl.innerHTML = '<div class="empty" style="color:#dc2626">状态加载失败: ' + escapeHtml(String(e)) + "</div>";
   }
+}
+
+function qcChip(cohortId, p) {
+  if (!p || p.diff_base_revision === null || p.diff_base_revision === undefined) return "";
+  const base = escapeHtml(String(p.diff_base_revision));
+  const cid = escapeJs(cohortId);
+  const rev = escapeJs(String(p.revision));
+  const link = ' <a href="#" onclick="return openDiff(\'' + cid + '\',\'' + rev + '\')">查看差异</a>';
+  if (p.qc_ambiguous) {
+    return '<div class="qc-chip qc-bad">差异质检：存在歧义（基线 rev' + base + '）·' + link + "</div>";
+  }
+  return '<div class="qc-chip qc-ok">差异质检通过（基线 rev' + base + '）·' + link + "</div>";
 }
 
 function renderTable(cohorts) {
@@ -120,28 +170,32 @@ function renderTable(cohorts) {
       action = '<span class="muted">无包记录</span>';
     } else if (p.status === "published") {
       action = '<a class="dl" href="/api/cohorts/' + encodeURIComponent(c.cohort_id) +
-               '/package" download>下载当前包 (rev' + p.revision + ")</a>";
+               '/package" download>下载当前包 (rev' + escapeHtml(String(p.revision)) + ")</a>";
+    } else if (p.status === "held") {
+      action = '<span class="muted">待核，不可下载</span><br>' +
+        '<button type="button" class="ghost mini" style="margin-top:6px" ' +
+        'onclick="openDiff(\'' + escapeJs(c.cohort_id) + '\',\'' + escapeJs(String(p.revision)) + '\')">查看歧义</button>';
     } else {
       action = '<span class="muted">不可下载</span>';
     }
     const retry = p && p.status === "failed"
-      ? ' <button type="button" class="ghost" style="padding:4px 10px;font-size:12px" ' +
-        'onclick="retryCohort(\'' + c.cohort_id.replace(/'/g, "\\'") + '\')">立即重试</button>'
+      ? ' <button type="button" class="ghost mini" ' +
+        'onclick="retryCohort(\'' + escapeJs(c.cohort_id) + '\')">立即重试</button>'
       : "";
     const errDetail = p && p.last_error
       ? '<div class="err-detail">' + escapeHtml(p.last_error) + "</div>" : "";
     return "<tr>" +
       "<td><strong>" + escapeHtml(c.cohort_id) + "</strong><br><span class='muted'>受试者 " +
         c.subject_count + " · 修订 " + c.revision_count + " 次</span></td>" +
-      "<td>rev" + c.current_revision + "</td>" +
+      "<td>rev" + escapeHtml(String(c.current_revision)) + "</td>" +
       '<td><span class="badge b-' + (p ? p.status : "pending") + '">' +
         (p ? STATUS_TEXT[p.status] || p.status : "—") + "</span>" +
         (p && p.attempts ? " <span class='muted'>第" + p.attempts + "次尝试</span>" : "") +
-        errDetail + retry + "</td>" +
+        errDetail + (p ? qcChip(c.cohort_id, p) : "") + retry + "</td>" +
       "<td>" + action + "</td>" +
     "</tr>";
   }).join("");
-  return "<table><thead><tr><th>队列</th><th>当前修订</th><th>包状态</th><th>操作</th></tr></thead><tbody>" +
+  return "<table><thead><tr><th>队列</th><th>当前修订</th><th>包状态 / 质检</th><th>操作</th></tr></thead><tbody>" +
          rows + "</tbody></table>";
 }
 
@@ -149,6 +203,79 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, ch =>
     ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
 }
+
+function escapeJs(s) {
+  return String(s).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+}
+
+async function openDiff(cohortId, revision) {
+  const body = document.getElementById("diffBody");
+  body.innerHTML = '<div class="empty">加载中…</div>';
+  document.getElementById("diffTitle").textContent =
+    "修订差异质检 · 队列 " + cohortId + " · rev" + revision;
+  document.getElementById("diffSub").textContent = "仅展示稳定假名与平移后日期，不含原始身份或原始日期";
+  document.getElementById("diffModal").classList.add("open");
+  try {
+    const resp = await fetch("/api/cohorts/" + encodeURIComponent(cohortId) +
+      "/revisions/" + encodeURIComponent(revision) + "/diff");
+    const data = await resp.json();
+    if (!resp.ok) {
+      body.innerHTML = '<div class="err-detail">' + escapeHtml(
+        typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail)) + "</div>";
+      return false;
+    }
+    body.innerHTML = renderDiff(data);
+  } catch (e) {
+    body.innerHTML = '<div class="err-detail">差异加载失败: ' + escapeHtml(String(e)) + "</div>";
+  }
+  return false;
+}
+window.openDiff = openDiff;
+
+function renderDiff(data) {
+  const s = data.summary;
+  const cells = [
+    ["相同抵消", s.identical_visits], ["新增", s.added], ["删除", s.removed],
+    ["测值更正", s.corrected], ["歧义", s.ambiguous]
+  ].map(([lbl, num]) =>
+    '<div class="cell"><div class="num">' + num + '</div><div class="lbl">' + lbl + "</div></div>").join("");
+  const banner = data.qc_ambiguous
+    ? '<div class="msg warn" style="display:block;margin-bottom:14px">该修订存在无法唯一配对的歧义记录，' +
+      '新包保持待核、不可下载；请按双方 CSV 行号核对后上传更正修订。</div>'
+    : '<div class="msg ok" style="display:block;margin-bottom:14px">差异质检通过，无歧义记录。</div>';
+  const rows = data.changes.map(ch => {
+    let detail;
+    if (ch.kind === "added") {
+      detail = "新 CSV 第 " + ch.new_line_no + " 行，测值 " + escapeHtml(String(ch.value));
+    } else if (ch.kind === "removed") {
+      detail = "旧 CSV 第 " + ch.old_line_no + " 行，测值 " + escapeHtml(String(ch.value));
+    } else if (ch.kind === "corrected") {
+      detail = "旧 CSV 第 " + ch.old_line_no + " 行测值 " + escapeHtml(String(ch.old_value)) +
+        " → 新 CSV 第 " + ch.new_line_no + " 行测值 " + escapeHtml(String(ch.new_value));
+    } else {
+      detail = '<div class="amb-box"><strong>无法唯一配对，未按行序猜测：</strong><br>' +
+        "旧 CSV 候选：" + ch.old_candidates.map(c => "第 " + c.line_no + " 行（测值 " +
+          escapeHtml(String(c.value)) + "）").join("；") + "<br>" +
+        "新 CSV 候选：" + ch.new_candidates.map(c => "第 " + c.line_no + " 行（测值 " +
+          escapeHtml(String(c.value)) + "）").join("；") + "</div>";
+    }
+    return "<tr><td><span class='kind-tag k-" + ch.kind + "'>" + (KIND_TEXT[ch.kind] || ch.kind) +
+      "</span></td><td>" + escapeHtml(ch.pseudonym) + "</td><td>" +
+      escapeHtml(ch.visit_date_shifted) + "</td><td>" + detail + "</td></tr>";
+  }).join("");
+  return banner +
+    '<div class="summary-grid">' + cells + '</div>' +
+    '<table><thead><tr><th>类型</th><th>假名</th><th>平移后访视日期</th><th>CSV 行号与测值</th></tr></thead><tbody>' +
+    (rows || '<tr><td colspan="4" class="empty">两版修订完全一致，无差异</td></tr>') +
+    "</tbody></table>";
+}
+
+document.getElementById("diffClose").addEventListener("click", () => {
+  document.getElementById("diffModal").classList.remove("open");
+});
+document.getElementById("diffModal").addEventListener("click", (ev) => {
+  if (ev.target.id === "diffModal") ev.target.classList.remove("open");
+});
 
 async function retryCohort(cohortId) {
   const msg = document.getElementById("uploadMsg");
@@ -182,9 +309,23 @@ document.getElementById("uploadForm").addEventListener("submit", async (ev) => {
       { method: "POST", body: fd }
     );
     const data = await resp.json().catch(() => ({}));
-    if (resp === 202 || resp.status === 202 || resp.ok) {
-      const verb = data.status === "duplicate" ? "内容与已受理修订完全一致（幂等，未重复受理）" : "修订已受理，新包待生成";
-      showMsg(msg, "ok", "队列 " + cohortId + " rev" + revision + "：" + verb);
+    if (resp.status === 202 || resp.status === 200) {
+      if (data.status === "duplicate") {
+        showMsg(msg, "ok", "队列 " + cohortId + " rev" + revision + "：内容与已受理修订完全一致（幂等，未重复受理）");
+      } else if (data.qc && data.qc.ambiguous) {
+        const s = data.qc.summary;
+        showMsg(msg, "warn", "队列 " + cohortId + " rev" + revision +
+          " 已受理，但差异质检发现 " + s.ambiguous + " 处歧义（相同抵消 " + s.identical_visits +
+          "、新增 " + s.added + "、删除 " + s.removed + "、更正 " + s.corrected +
+          "）。旧包已撤下，新包保持待核、不可下载；请查看差异并上传更正修订。");
+      } else if (data.qc && data.qc.checked) {
+        const s = data.qc.summary;
+        showMsg(msg, "ok", "队列 " + cohortId + " rev" + revision +
+          " 已受理且质检通过（相同抵消 " + s.identical_visits + "、新增 " + s.added +
+          "、删除 " + s.removed + "、更正 " + s.corrected + "），新包待生成");
+      } else {
+        showMsg(msg, "ok", "队列 " + cohortId + " rev" + revision + "：修订已受理，新包待生成（首次修订无差异基线）");
+      }
     } else {
       showMsg(msg, "err", "[" + resp.status + "] " + (typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail)));
     }

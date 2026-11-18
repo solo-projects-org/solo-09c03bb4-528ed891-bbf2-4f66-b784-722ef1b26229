@@ -67,6 +67,19 @@ CREATE TABLE IF NOT EXISTS packages (
     PRIMARY KEY (cohort_id, revision)
 );
 
+-- Revision-difference QC results. The payload only ever contains pseudonyms
+-- and shifted dates (see app/diffqc.py); original subject ids and original
+-- dates are never persisted here or returned by any interface.
+CREATE TABLE IF NOT EXISTS revision_diffs (
+    cohort_id        TEXT NOT NULL,
+    revision         INTEGER NOT NULL,
+    base_revision    INTEGER NOT NULL,
+    qc_ambiguous     INTEGER NOT NULL,
+    diff_json        TEXT NOT NULL,
+    created_at       TEXT NOT NULL,
+    PRIMARY KEY (cohort_id, revision)
+);
+
 CREATE INDEX IF NOT EXISTS idx_packages_claim
     ON packages(status, next_retry_at);
 """
